@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -98,19 +99,32 @@ class InboxStore:
     # -- persistence ------------------------------------------------------------
     def _load(self) -> None:
         if self.path and self.path.is_file():
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, ValueError):
+                # File is corrupt (e.g. truncated by a previous non-atomic write).
+                # Start with an empty inbox rather than crashing the whole session.
+                data = {}
             for raw in data.get("items", []):
                 item = InboxItem(**raw)
                 self._items[item.id] = item
 
     def _save(self) -> None:
+        """Atomic save via tmp-file + os.replace().
+
+        write_text() truncates-then-writes, so a crash mid-way leaves an empty
+        file and silently destroys all inbox data. os.replace() is atomic on
+        POSIX (rename(2)); on Windows it is as close to atomic as the OS allows.
+        """
         if not self.path:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"items": [asdict(i) for i in self._items.values()]}, indent=2),
-            encoding="utf-8",
+        payload = json.dumps(
+            {"items": [asdict(i) for i in self._items.values()]}, indent=2
         )
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, self.path)  # atomic on POSIX; best-effort on Windows
 
     # -- adding -----------------------------------------------------------------
     def add(
@@ -321,12 +335,21 @@ class InboxStore:
         return closed
 
     async def wait(self, item_id: str) -> str:
-        """Await an item's resolution; returns the resolution string. Used by the approver to
-        suspend the agent until a human answers (from any surface)."""
+        """Await an item's resolution; returns the resolution string.
+
+        Race-safe: waiter is registered BEFORE the state is checked.
+        Old order (check-then-register) had a window where resolve() could
+        fire between the check and setdefault(), leaving the new event unset
+        and hanging the agent forever.
+        """
+        # Register waiter first so resolve() always finds it if it fires after this line.
+        ev = self._waiters.setdefault(item_id, asyncio.Event())
+        # Now check: resolve() may have already run before we registered (and set
+        # the event on a pre-existing waiter, or found _waiters empty). Either way
+        # the item's state is authoritative.
         item = self._items.get(item_id)
         if item is not None and item.state == STATE_RESOLVED:
             return item.resolution or ""
-        ev = self._waiters.setdefault(item_id, asyncio.Event())
         await ev.wait()
         resolved = self._items.get(item_id)
         return (resolved.resolution if resolved else "") or ""
@@ -357,6 +380,7 @@ def inbox_approver(store: InboxStore, session_id: str, *, inbox: str = "default"
             title=f"Run `{request.tool_name}`?",
             body=request.reason or "",
             inbox=inbox,
+            tool_call_id=request.tool_call_id,  # fix bug1: forward so durable-resume is idempotent
         )
         resolution = await store.wait(item.id)
         if resolution == "always":
