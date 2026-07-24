@@ -1,7 +1,12 @@
-"""Reproduce the real bugs found in the deep audit.
+"""Reproduce the real bugs found in deep audit.
 
-Each test is named after the bug it exposes. A FAILING test = bug confirmed.
-After fixes, all tests should pass.
+Mỗi test tên theo bug nó expose. Test FAIL = bug confirmed tồn tại.
+Sau khi fix, tất cả phải pass.
+
+Đọc source thực tế trước khi viết:
+- coworker/inbox.py  (InboxStore, inbox_approver)
+- coworker/engine.py (PermissionRequest)
+- coworker/tools/shell.py (LocalExecutor._bg_counter, _bg_tasks)
 """
 from __future__ import annotations
 
@@ -11,16 +16,28 @@ import time
 
 import pytest
 
+
 # ---------------------------------------------------------------------------
-# BUG 1: inbox_approver drops tool_call_id
-# Expected: add_approval is called WITH tool_call_id so durable-resume
-#           finds the existing item and does NOT create a duplicate.
-# Actual:   tool_call_id is never passed -> for_tool_call() always misses
-#           -> a second resume call creates a SECOND inbox item.
+# BUG 1: inbox_approver bỏ tool_call_id
+#
+# Source inbox_approver (inbox.py, cuối file):
+#
+#   async def approve(request):
+#       item = store.add_approval(
+#           session_id,
+#           title=f"Run `{request.tool_name}`?",
+#           body=request.reason or "",
+#           inbox=inbox,
+#           # tool_call_id=request.tool_call_id  <-- MISSING
+#       )
+#
+# Engine (engine.py) truyền tool_call_id vào PermissionRequest nhưng
+# inbox_approver không forward nó sang add_approval → for_tool_call() trả None
+# → durable resume tạo item thứ 2 → user bị hỏi lại lần nữa.
 # ---------------------------------------------------------------------------
 
 def test_bug1_inbox_approver_drops_tool_call_id(tmp_path):
-    """inbox_approver must propagate tool_call_id so durable-resume is idempotent."""
+    """inbox_approver phải forward tool_call_id để durable-resume idempotent."""
     from coworker.engine import ApprovalOutcome, PermissionRequest
     from coworker.inbox import InboxStore, inbox_approver
 
@@ -31,57 +48,79 @@ def test_bug1_inbox_approver_drops_tool_call_id(tmp_path):
         arguments={"command": "rm -rf /"},
         metadata=None,
         reason="needs approval",
-        tool_call_id="call-abc-123",  # the engine passes this
+        tool_call_id="call-abc-123",
     )
 
     async def run():
         async def resolve_soon():
-            for _ in range(300):
+            for _ in range(500):
                 pend = store.pending("s1")
                 if pend:
                     store.resolve(pend[0].id, "allow")
                     return
                 await asyncio.sleep(0.001)
 
-        await asyncio.gather(approver(req), resolve_soon())
+        # approver trả ApprovalOutcome (không phải tuple)
+        outcome = await asyncio.gather(approver(req), resolve_soon())
+        return outcome[0]  # outcome[1] là None từ resolve_soon
 
     asyncio.run(run())
 
     items = store.list(session_id="s1")
-    assert len(items) == 1, f"Expected 1 item, got {len(items)} (duplicate created)"
-
-    # The item must carry tool_call_id for for_tool_call() to find it on resume
-    assert items[0].tool_call_id == "call-abc-123", (
-        f"tool_call_id not stored: got {items[0].tool_call_id!r}"
+    assert len(items) == 1, (
+        f"BUG 1 CONFIRMED: tạo {len(items)} items thay vì 1 "
+        "(duplicate do tool_call_id không được lưu)"
     )
 
-    # Simulating durable resume: calling add() with same tool_call_id must return
-    # the EXISTING item (idempotent), not create a new one.
+    # Item phải mang tool_call_id để for_tool_call() tìm được khi resume
+    assert items[0].tool_call_id == "call-abc-123", (
+        f"BUG 1 CONFIRMED: tool_call_id không lưu, got {items[0].tool_call_id!r}\n"
+        "Consequence: durable resume gọi add_approval lần 2 → item mới → prompt lại"
+    )
+
+    # Simulate durable resume: for_tool_call phải tìm được item cũ
     existing = store.for_tool_call("s1", "call-abc-123")
-    assert existing is not None, "for_tool_call() cannot find the item -> resume will re-prompt"
+    assert existing is not None, (
+        "BUG 1 CONFIRMED: for_tool_call() trả None → resume sẽ tạo duplicate item"
+    )
 
 
 # ---------------------------------------------------------------------------
 # BUG 2: InboxStore.wait() race condition
-# A resolve() that arrives between the 'already resolved?' check and
-# _waiters.setdefault() is silently dropped, leaving wait() blocked forever.
-# We simulate this by monkey-patching _waiters.setdefault to inject a
-# resolve() call in the window between the check and the setdefault.
+#
+# Source wait() (inbox.py):
+#
+#   async def wait(self, item_id):
+#       item = self._items.get(item_id)
+#       if item and item.state == STATE_RESOLVED:   # <-- check state
+#           return item.resolution or ""
+#       ev = self._waiters.setdefault(item_id, asyncio.Event())  # <-- race window
+#       await ev.wait()
+#
+# Nếu resolve() chạy giữa dòng check và setdefault → event được tạo
+# nhưng resolve() đã fire rồi → .set() không gọi nữa → wait() block mãi mãi.
 # ---------------------------------------------------------------------------
 
-def test_bug2_wait_race_condition_resolve_before_setdefault(tmp_path):
-    """resolve() between state-check and setdefault must not cause infinite hang."""
+def test_bug2_wait_race_resolve_arrives_before_setdefault(tmp_path):
+    """resolve() đến giữa state-check và setdefault phải không gây hang vĩnh viễn."""
     from coworker.inbox import InboxStore
 
     store = InboxStore(tmp_path / "inbox.json")
-    item = store.add_approval("s1", "Approve?")
+    item = store.add_approval("s1", "Approve deploy?")
 
+    # Patch setdefault để inject resolve() vào đúng race window
     original_setdefault = store._waiters.setdefault
 
+    injected = False
+
     def racing_setdefault(key, default):
-        # Inject resolve() BEFORE the event is registered in _waiters.
-        # If the race guard is absent, wait() will block forever after this.
-        store.resolve(item.id, "allow")
+        nonlocal injected
+        if not injected and key == item.id:
+            # Resolve TRƯỚC KHI event được đăng ký vào _waiters
+            # Nếu bug tồn tại: resolve() gọi _waiters.get() → None → không set()
+            # → event mới tạo xong nhưng không bao giờ được set → hang mãi mãi
+            store.resolve(item.id, "allow")
+            injected = True
         return original_setdefault(key, default)
 
     store._waiters.setdefault = racing_setdefault
@@ -91,80 +130,99 @@ def test_bug2_wait_race_condition_resolve_before_setdefault(tmp_path):
             result = await asyncio.wait_for(store.wait(item.id), timeout=2.0)
             return result
         except asyncio.TimeoutError:
-            return "TIMEOUT"  # bug: hung because resolve() was missed
+            return "TIMEOUT"
 
     result = asyncio.run(run())
     assert result != "TIMEOUT", (
-        "wait() hung: resolve() that arrived before setdefault() was lost"
+        "BUG 2 CONFIRMED: wait() hung sau 2 giây.\n"
+        "resolve() chạy trước setdefault() → event không bao giờ được .set()\n"
+        "Fix: check lại state SAU setdefault() hoặc dùng lock bao phủ cả 2 bước"
     )
-    assert result == "allow"
+    assert result == "allow", f"Expected 'allow', got {result!r}"
 
 
 # ---------------------------------------------------------------------------
-# BUG 3: InboxStore._save() is not atomic
-# write_text() truncates then writes. A crash mid-write corrupts the file.
-# We simulate by patching write_text to raise mid-way, then verify the
-# file is not left in a truncated/empty state.
+# BUG 3: InboxStore._save() không atomic
+#
+# Source _save() (inbox.py):
+#
+#   def _save(self):
+#       self.path.write_text(json.dumps(...), encoding="utf-8")
+#
+# write_text() = truncate → write. Crash giữa chừng (disk full, SIGKILL)
+# → file bị truncate về rỗng → reload mất toàn bộ data.
+# Fix: ghi ra .tmp rồi os.replace() (atomic trên POSIX và Windows).
 # ---------------------------------------------------------------------------
 
-def test_bug3_inbox_save_not_atomic(tmp_path, monkeypatch):
-    """_save() must not leave a truncated file if interrupted mid-write."""
+def test_bug3_save_not_atomic_data_loss_on_crash(tmp_path, monkeypatch):
+    """Crash giữa write phải không xóa sạch file inbox cũ."""
     from pathlib import Path
     from coworker.inbox import InboxStore
 
-    store = InboxStore(tmp_path / "inbox.json")
+    path = tmp_path / "inbox.json"
+    store = InboxStore(path)
     item = store.add_approval("s1", "Safe data")
     store.resolve(item.id, "allow")
 
-    # Verify the file exists and is valid before the test.
-    path = tmp_path / "inbox.json"
-    assert path.exists()
-    original_content = path.read_text()
-    assert "Safe data" in original_content
+    # Verify baseline: file tồn tại và có data
+    assert path.exists() and "Safe data" in path.read_text()
 
-    # Now simulate a crash mid-write: patch write_text on the Path instance
-    # to truncate the file and then raise (simulating disk-full / SIGKILL).
-    original_write = Path.write_text
+    original_write_text = Path.write_text
+
+    call_count = [0]
 
     def crashing_write(self, content, **kwargs):
-        if self == path:
-            # Truncate first (simulates partial write)
+        call_count[0] += 1
+        if call_count[0] == 1 and self == path:
+            # Truncate (write_text làm điều này trước tiên) rồi crash
             self.write_bytes(b"")
-            raise OSError("Simulated disk full")
-        return original_write(self, content, **kwargs)
+            raise OSError("Simulated disk full mid-write")
+        return original_write_text(self, content, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", crashing_write)
 
-    # Adding a new item triggers _save() which will crash mid-write
     try:
-        store.add_approval("s1", "New item")
+        store.add_approval("s1", "New item triggers save")
     except OSError:
-        pass
+        pass  # expected
 
-    # The original data should still be intact if _save() used atomic write.
-    # With the bug: the file is now empty -> reload loses all previous items.
     monkeypatch.undo()
-    reloaded = InboxStore(tmp_path / "inbox.json")
+
+    # Reload: nếu save atomic, data cũ vẫn còn
+    reloaded = InboxStore(path)
     items = reloaded.list(session_id="s1")
-    assert len(items) >= 1, "All inbox data lost due to non-atomic write"
+
+    assert len(items) >= 1, (
+        "BUG 3 CONFIRMED: File bị truncate, tất cả data mất sau crash mid-write.\n"
+        "Fix: write to <path>.tmp rồi os.replace(tmp, path)"
+    )
     assert any(i.title == "Safe data" for i in items), (
-        "Previously resolved item wiped by failed non-atomic _save()"
+        "BUG 3 CONFIRMED: Item 'Safe data' mất sau crash. Non-atomic write đã xóa nó."
     )
 
 
 # ---------------------------------------------------------------------------
-# BUG 4: shell._bg_counter not thread-safe -> duplicate task IDs
-# Concurrent run_background() calls from two threads can produce the same
-# task_id, causing the second to silently overwrite the first in _bg_tasks.
+# BUG 4: LocalExecutor._bg_counter không thread-safe
+#
+# Source run_background() (shell.py):
+#
+#   def run_background(self, command):
+#       self._bg_counter += 1          # <-- not atomic
+#       task_id = f"bg-{self._bg_counter}"
+#       self._bg_tasks[task_id] = task # <-- overwrite nếu duplicate ID
+#
+# Python GIL không đảm bảo i += 1 là atomic nếu có nhiều luồng.
+# Concurrent calls có thể đọc cùng giá trị counter → cùng task_id
+# → task sau overwrite task trước trong _bg_tasks → silent data loss.
 # ---------------------------------------------------------------------------
 
 def test_bug4_bg_counter_not_thread_safe(tmp_path):
-    """Concurrent run_background() must not produce duplicate task IDs."""
+    """Concurrent run_background() không được tạo duplicate task IDs."""
     from coworker.tools.shell import LocalExecutor
 
     ex = LocalExecutor(cwd=tmp_path, default_timeout=5)
     task_ids = []
-    lock = threading.Lock()
+    id_lock = threading.Lock()
     errors = []
 
     def launch():
@@ -172,12 +230,14 @@ def test_bug4_bg_counter_not_thread_safe(tmp_path):
             result = ex.run_background("echo bg")
             tid = result.get("task_id")
             if tid:
-                with lock:
+                with id_lock:
                     task_ids.append(tid)
         except Exception as e:
-            errors.append(e)
+            with id_lock:
+                errors.append(str(e))
 
-    threads = [threading.Thread(target=launch) for _ in range(10)]
+    # 20 threads cùng lúc để maximize race condition
+    threads = [threading.Thread(target=launch) for _ in range(20)]
     for t in threads:
         t.start()
     for t in threads:
@@ -185,51 +245,62 @@ def test_bug4_bg_counter_not_thread_safe(tmp_path):
 
     ex.close()
 
-    assert not errors, f"Exceptions during concurrent launch: {errors}"
-    assert len(task_ids) == len(set(task_ids)), (
-        f"Duplicate task IDs found: {sorted(task_ids)}"
+    assert not errors, f"Exceptions: {errors}"
+    duplicates = len(task_ids) - len(set(task_ids))
+    assert duplicates == 0, (
+        f"BUG 4 CONFIRMED: {duplicates} duplicate task IDs trong {len(task_ids)} launches.\n"
+        f"IDs: {sorted(task_ids)}\n"
+        "Fix: dùng threading.Lock() bảo vệ _bg_counter += 1"
     )
 
 
 # ---------------------------------------------------------------------------
-# BUG 5: shell._bg_tasks never pruned -> memory grows unboundedly
-# After a background task exits, its entry stays in _bg_tasks forever.
+# BUG 5: LocalExecutor._bg_tasks không pruned → memory leak
+#
+# Source: background_output() và background_kill() đọc/xóa task từ _bg_tasks
+# nhưng KHÔNG bao giờ prune các task đã exit. Với session dài chạy hàng
+# nghìn background tasks, _bg_tasks tích lũy vô hạn các dead _BackgroundTask
+# objects + subprocess handles.
 # ---------------------------------------------------------------------------
 
-def test_bug5_bg_tasks_not_pruned(tmp_path):
-    """Exited background tasks must not accumulate in _bg_tasks forever."""
+def test_bug5_bg_tasks_accumulate_dead_entries(tmp_path):
+    """Dead background tasks phải được prune khỏi _bg_tasks sau khi exit."""
     from coworker.tools.shell import LocalExecutor
 
     ex = LocalExecutor(cwd=tmp_path, default_timeout=5)
-
-    # Start and wait for 15 quick tasks to exit.
+    N = 20
     task_ids = []
-    for _ in range(15):
+
+    for _ in range(N):
         r = ex.run_background("echo done")
         task_ids.append(r["task_id"])
 
-    # Wait for all to exit.
-    deadline = time.monotonic() + 5.0
+    # Chờ tất cả exit
+    deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
         all_done = all(
-            ex._bg_tasks.get(tid) and ex._bg_tasks[tid].proc.poll() is not None
-            for tid in task_ids
+            task_ids[i] in ex._bg_tasks
+            and ex._bg_tasks[task_ids[i]].proc.poll() is not None
+            for i in range(N)
         )
         if all_done:
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
 
-    # Read output to trigger any pruning logic (if implemented).
+    # Đọc output để trigger bất kỳ pruning logic nào (nếu có)
     for tid in task_ids:
         ex.background_output(tid)
 
     ex.close()
 
-    # After 15 exited tasks, the dict should NOT hold all 15 dead entries.
-    # If pruning is absent, this assertion fails proving the leak.
-    dead_count = sum(
-        1 for t in ex._bg_tasks.values() if t.proc.poll() is not None
-    )
-    assert dead_count < 15, (
-        f"All {dead_count} exited tasks still in _bg_tasks — memory leak confirmed"
+    # Đếm dead entries còn trong _bg_tasks
+    dead = [
+        tid for tid in task_ids
+        if tid in ex._bg_tasks and ex._bg_tasks[tid].proc.poll() is not None
+    ]
+
+    # Nếu không có pruning: tất cả N tasks vẫn còn → bug confirmed
+    assert len(dead) < N, (
+        f"BUG 5 CONFIRMED: {len(dead)}/{N} exited tasks vẫn còn trong _bg_tasks.\n"
+        "Fix: prune trong background_output() sau khi read tất cả output của task đã exit"
     )
