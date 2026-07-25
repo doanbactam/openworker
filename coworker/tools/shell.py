@@ -378,12 +378,14 @@ class LocalExecutor(Executor):
         command, so it must run as its own statement right after it."""
         if self._is_windows:
             # PowerShell: `$?` is the success bool; `$LASTEXITCODE` is the exit code of the
-            # last native program. Success → 0; else the program's code, falling back to 1.
-            return (
-                f'"`n{self._marker} '
-                f"$(if ($?) 0 else {{ if ($LASTEXITCODE) {{$LASTEXITCODE}} else https://app.notion.com/p/3a1dfce8d927803bb6c5ca1533cb76f8 }}) "
-                f'$($PWD.Path)"\n'
+            # last native program. Success -> 0; else the program's code, falling back to 1.
+            # Built as a plain (non-f) string so PowerShell's literal braces survive verbatim
+            # (an f-string would require brace-doubling, which is error-prone to edit).
+            exit_expr = (
+                "$(if ($?) {0} else "
+                "{ if ($LASTEXITCODE) {$LASTEXITCODE} else {1} })"
             )
+            return f'"`n{self._marker} ' + exit_expr + ' $($PWD.Path)"\n'
         return f'printf "\\n%s %s %s\\n" "{self._marker}" "$?" "$PWD"\n'
 
     def _interrupt(self) -> None:
