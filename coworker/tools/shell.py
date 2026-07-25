@@ -123,6 +123,12 @@ class _BackgroundTask:
         with self._lock:
             return self._cursor < len(self._lines)
 
+    def is_finished(self) -> bool:
+        """Process exited AND the reader thread has hit EOF and stopped. Only then is
+        _lines guaranteed to hold everything the task will ever produce — poll() alone
+        can race ahead of the reader while its final output is still in the OS pipe."""
+        return self.proc.poll() is not None and not self._reader.is_alive()
+
     def kill(self) -> None:
         if self.proc.poll() is not None:
             return
@@ -342,11 +348,11 @@ class LocalExecutor(Executor):
         if truncated:
             output = output[-self.max_output_chars :]
         exit_code = task.proc.poll()
-        # Bug 5 fix: prune a task once it has exited AND all its output has been
-        # drained, so long-lived sessions don't accumulate dead tasks forever. We
-        # only prune after the final read returns nothing new and the buffer is
-        # fully consumed, so no output is ever lost.
-        if exit_code is not None and not output and not task.has_unread():
+        # Bug 5 fix: prune a task once it has fully finished (process exited AND reader
+        # thread drained to EOF) AND all its output has been read. is_finished() guards
+        # against poll() racing ahead of the reader, which would otherwise drop the
+        # task's final line. Long-lived sessions no longer accumulate dead tasks.
+        if task.is_finished() and not output and not task.has_unread():
             with self._bg_lock:
                 self._bg_tasks.pop(task_id, None)
         return {
