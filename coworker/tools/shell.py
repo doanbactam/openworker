@@ -116,6 +116,13 @@ class _BackgroundTask:
             self._cursor = len(self._lines)
         return new
 
+    def has_unread(self) -> bool:
+        """True if the buffer still holds output the caller hasn't read yet. Used by
+        the executor to decide when a dead task is safe to prune (never drop output
+        the agent hasn't seen)."""
+        with self._lock:
+            return self._cursor < len(self._lines)
+
     def kill(self) -> None:
         if self.proc.poll() is not None:
             return
@@ -151,6 +158,9 @@ class LocalExecutor(Executor):
         self._is_windows = _IS_WINDOWS
         self._bg_tasks: dict[str, _BackgroundTask] = {}
         self._bg_counter = 0
+        # Guards _bg_counter and _bg_tasks against concurrent run_background() calls
+        # from multiple threads (the engine runs tool calls in worker threads).
+        self._bg_lock = threading.Lock()
         # Set by interrupt_now() (user Stop) — run()'s read loop treats it like an
         # early deadline, so the in-flight foreground command dies within one tick.
         self._abort = threading.Event()
@@ -305,13 +315,17 @@ class LocalExecutor(Executor):
 
     # -- background tasks ---------------------------------------------------------
     def run_background(self, command: str) -> dict[str, Any]:
-        self._bg_counter += 1
-        task_id = f"bg-{self._bg_counter}"
+        # Bug 4 fix: allocate the ID and register the task under the lock so two
+        # threads can't read the same counter value and clobber each other's entry.
+        with self._bg_lock:
+            self._bg_counter += 1
+            task_id = f"bg-{self._bg_counter}"
         try:
             task = _BackgroundTask(task_id, command, self.cwd, self._env)
         except OSError as exc:
             return {"error": f"failed to start background task: {exc}"}
-        self._bg_tasks[task_id] = task
+        with self._bg_lock:
+            self._bg_tasks[task_id] = task
         return {
             "task_id": task_id,
             "command": command,
@@ -328,6 +342,13 @@ class LocalExecutor(Executor):
         if truncated:
             output = output[-self.max_output_chars :]
         exit_code = task.proc.poll()
+        # Bug 5 fix: prune a task once it has exited AND all its output has been
+        # drained, so long-lived sessions don't accumulate dead tasks forever. We
+        # only prune after the final read returns nothing new and the buffer is
+        # fully consumed, so no output is ever lost.
+        if exit_code is not None and not output and not task.has_unread():
+            with self._bg_lock:
+                self._bg_tasks.pop(task_id, None)
         return {
             "task_id": task_id,
             "status": "running" if exit_code is None else "exited",
@@ -360,7 +381,7 @@ class LocalExecutor(Executor):
             # last native program. Success → 0; else the program's code, falling back to 1.
             return (
                 f'"`n{self._marker} '
-                f"$(if ($?) {{0}} else {{ if ($LASTEXITCODE) {{$LASTEXITCODE}} else {{1}} }}) "
+                f"$(if ($?) 0 else {{ if ($LASTEXITCODE) {{$LASTEXITCODE}} else https://app.notion.com/p/3a1dfce8d927803bb6c5ca1533cb76f8 }}) "
                 f'$($PWD.Path)"\n'
             )
         return f'printf "\\n%s %s %s\\n" "{self._marker}" "$?" "$PWD"\n'
